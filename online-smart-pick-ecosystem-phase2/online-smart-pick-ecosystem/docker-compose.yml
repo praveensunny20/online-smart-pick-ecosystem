@@ -1,0 +1,201 @@
+# =============================================================
+# Online Smart Pick Ecosystem — Docker Compose (Phase 2)
+# =============================================================
+# Services:
+#   - postgres: PostgreSQL 16 database
+#   - redis:    Redis 7 cache / Celery broker
+#   - backend:  FastAPI app
+#   - worker:   Celery worker (sync_client_metrics, sync_all_clients)   [Phase 2]
+#   - beat:     Celery Beat scheduler (3 AM UTC nightly sync)           [Phase 2]
+#
+# Run:
+#   docker compose up                     # start everything
+#   docker compose up -d                  # start in background
+#   docker compose down                   # stop everything (data kept)
+#   docker compose down -v                # stop and WIPE data
+#   docker compose logs -f backend        # tail backend logs
+#   docker compose logs -f worker         # tail worker logs (watch syncs run)
+#   docker compose logs -f beat           # tail scheduler logs
+#   docker compose restart worker         # restart just the worker
+# =============================================================
+
+services:
+  # -----------------------------------------------------------
+  # PostgreSQL 16 — primary database
+  # -----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartpick_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smartpick}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartpick_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-smartpick_db}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C --data-checksums"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smartpick} -d ${POSTGRES_DB:-smartpick_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - smartpick_net
+
+  # -----------------------------------------------------------
+  # Redis 7 — cache and Celery broker
+  # -----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: smartpick_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - smartpick_net
+
+  # -----------------------------------------------------------
+  # FastAPI backend
+  # -----------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smartpick_backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount source for live-reload during development.
+      # Remove this volume in production so the image's code is used.
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+    networks:
+      - smartpick_net
+
+  # -----------------------------------------------------------
+  # Celery worker — runs sync tasks (Phase 2)
+  # -----------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smartpick_worker
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # --concurrency=2 is fine for dev; Railway should auto-scale in prod.
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --concurrency=2
+    # Override the image healthcheck — workers don't expose HTTP
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - smartpick_net
+
+  # -----------------------------------------------------------
+  # Celery Beat — scheduler (Phase 2)
+  # -----------------------------------------------------------
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smartpick_beat
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - ./backend:/app
+      # Beat keeps its schedule state in this file so it remembers the last
+      # run time across restarts (otherwise it could double-fire jobs).
+      - beat_data:/app/.celerybeat
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.workers.celery_app beat
+      --loglevel=info
+      --schedule=/app/.celerybeat/schedule
+    networks:
+      - smartpick_net
+
+
+# -----------------------------------------------------------
+# Named volumes — data survives container restarts
+# -----------------------------------------------------------
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  beat_data:
+    driver: local
+
+
+# -----------------------------------------------------------
+# Private network so services can talk by name
+# -----------------------------------------------------------
+networks:
+  smartpick_net:
+    driver: bridge

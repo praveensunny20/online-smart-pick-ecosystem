@@ -1,0 +1,206 @@
+===============================================================================
+PHASE 2 → PHASE 3 HANDOFF
+Online Smart Pick Ecosystem
+===============================================================================
+
+WHAT WAS DELIVERED IN PHASE 2
+-----------------------------
+Backend only — frontend/src/lib/api.ts got new method signatures, but no UI
+work happened this phase.
+
+1. Email (Resend) integration with console fallback. Works offline.
+   See backend/app/core/email.py.
+
+2. Four new auth endpoints:
+     POST /api/v1/auth/verify-email
+     POST /api/v1/auth/resend-verification        (auth required)
+     POST /api/v1/auth/password-reset/request
+     POST /api/v1/auth/password-reset/confirm
+   All flows include email sending; both verification and password-reset
+   use scoped JWT types so tokens can't be swapped for access tokens.
+
+3. Rate limiting via slowapi on signup (5/hr), login (10/min), and
+   password-reset-request (5/hr). Limiter lives in app/main_limiter.py
+   as a separate module so main.py and api/auth.py both import from it
+   without circular-import risk.
+
+4. Postgres Row-Level Security activated as defense-in-depth:
+   app/api/deps.py::set_rls_context() sets app.current_agency_id via
+   set_config(..., true) on every authenticated request.
+
+5. Metric normalization layer (app/services/normalization.py) — dict-driven
+   mapping from every PlatformType's raw fields to a unified vocabulary
+   (impressions, clicks, spend_usd, conversions, revenue_usd, ctr, cpc, roas,
+   engagements, sessions, users, reach, followers, bounce_rate, etc.)
+   Includes special-case handling for Google Ads cost_micros and Pinterest
+   conversion value in micro-dollars.
+
+6. Pluggable data-provider system:
+     mock         — deterministic, seeded PRNG, per-platform baseline ranges.
+                    Produces one row per day × 2 campaigns × every configured
+                    metric. Works with zero external credentials.
+     windsor      — skeleton; raises NotImplementedError. Phase 3.
+     supermetrics — skeleton; raises NotImplementedError. Phase 3.
+   Factory: app/services/data_providers/__init__.py::get_data_provider()
+   reads settings.DATA_PROVIDER.
+
+7. Celery worker + Celery Beat:
+     sync_client_metrics(client_id) — fetch + normalize + delete-then-insert
+       into unified_metrics_cache. Autoretries with backoff. Uses a sync
+       psycopg2 session (not asyncpg) because Celery tasks aren't async.
+     sync_all_clients() — iterates every active client, enqueues per-client
+       tasks. Wired to 3:00 UTC via Beat (configurable).
+
+8. Three new read APIs for metrics:
+     GET /api/v1/clients/{id}/metrics[?platform&metric_name&start_date&end_date&limit]
+     GET /api/v1/clients/{id}/metrics/timeseries?metric_name=...&...
+     GET /api/v1/clients/{id}/metrics/summary
+
+9. One new write API for on-demand sync:
+     POST /api/v1/data/sync/{client_id}  (202 Accepted, returns task_id)
+
+10. Docker Compose now has 5 services: postgres, redis, backend, worker, beat.
+    beat_data volume persists Beat's schedule state across restarts so it
+    doesn't double-fire jobs.
+
+11. backend/.env.example documents every new key. backend/.env (live) has the
+    new keys appended so `docker compose up` works immediately.
+
+12. frontend/src/lib/api.ts adds typed methods: verifyEmail,
+    resendVerification, requestPasswordReset, confirmPasswordReset,
+    listMetrics, metricTimeseries, metricSummary, triggerSync — ready for
+    Phase 3 UI work. No UI screens were built.
+
+13. Full run instructions in RUN_INSTRUCTIONS.md with curl examples for every
+    new endpoint and a "verify the sync actually ran" SQL check.
+
+
+WHAT PHASE 2 DELIBERATELY DID NOT DO
+------------------------------------
+- No new Alembic migration. Phase 1's schema already had every column Phase 2
+  needed. If Phase 3 normalization reveals a missing column, create a migration
+  then — don't edit 0001 in place.
+- No frontend UI. Email-verify / password-reset / metric-dashboard screens
+  are Phase 3. The api.ts methods are ready to call.
+- No production email. Works in console mode by default. Flip the Resend key
+  in .env when you're ready.
+- No real platform integrations. Mock provider only. Windsor + Supermetrics
+  skeletons are in place as Phase 3 starting points.
+- No Google OAuth verification work. That's still the deployment-time
+  blocker for Phase 3 and belongs in the Phase 3 prompt.
+- No Celery monitoring UI (Flower). Logs are enough for now.
+
+
+PHASE 3 SCOPE — WHAT YOU (PRAVEEN) SHOULD ASK A FRESH CHAT TO BUILD
+-------------------------------------------------------------------
+
+A. FRONTEND — Next.js 15.1 App Router, Tailwind brand.blue #1E3A5F / brand.green #10B981
+
+   A.1 Pages (src/app/):
+       /verify-email/page.tsx       — reads ?token=, calls api.verifyEmail,
+                                       shows success/failure, CTA "Go to dashboard"
+       /forgot-password/page.tsx    — email field → api.requestPasswordReset
+       /reset-password/page.tsx     — reads ?token=, new-password form →
+                                       api.confirmPasswordReset, then redirect to /login
+       /dashboard/clients/[id]/page.tsx — client detail page:
+           - api.metricSummary for stat cards
+           - api.metricTimeseries for a line chart (recommend Recharts — already
+             in the AI-in-Artifacts ecosystem and small bundle)
+           - api.listMetrics for a data table
+           - A "Refresh data" button calling api.triggerSync
+       /dashboard/clients/[id]/connections/page.tsx — list + add + delete
+
+   A.2 Login / signup screens should handle the is_email_verified flag:
+       show a yellow "Please verify your email" banner with a
+       "Resend verification email" button calling api.resendVerification.
+
+B. REAL DATA PROVIDERS
+
+   B.1 Windsor.ai (app/services/data_providers/windsor.py):
+       - Replace NotImplementedError with real implementation.
+       - Endpoint: POST https://api.windsor.ai/{connector}/  with
+           {api_key, date_from, date_to, fields, ...}
+       - Connector name map: PlatformType.META_ADS → "facebook",
+           .GOOGLE_ADS → "adwords", etc. (doc it at the top of the file)
+       - Credentials dict provides the per-account id; settings.WINDSOR_API_KEY
+         provides the global Windsor key.
+       - Return rows in the SAME SHAPE the mock provider returns. That way the
+         normalization layer needs zero changes.
+
+   B.2 Supermetrics (app/services/data_providers/supermetrics.py):
+       - Same deal, using the Supermetrics API.
+
+C. AI ENGINE (Phase 4 territory — defer unless Phase 3 gets small):
+   - app/services/ai_service.py — wraps Anthropic client with retry + prompt templates.
+   - app/services/smart_pick_generator.py — reads unified_metrics_cache, asks
+     Claude for analysis, writes smart_picks_cache rows.
+   - New Celery task: generate_smart_picks(client_id) chained after
+     sync_client_metrics.
+
+D. GOOGLE OAUTH VERIFICATION BLOCKER
+   This is deployment prep. After Phase 3 frontend is deployed to Vercel:
+   - Live /privacy-policy and /terms-of-service pages.
+   - 1–2 min demo video (Loom) showing the OAuth flow.
+   - Submit for Google OAuth app verification. Takes 2–6 weeks.
+   - Until approved, only test users can complete the Google login flow.
+
+E. RAILWAY + VERCEL DEPLOYMENT (Phase 6 originally; can start Phase 3):
+   - Railway: provision Postgres + Redis, push the backend image, run
+     alembic upgrade head, deploy worker + beat as separate services.
+   - Railway env vars: copy from .env, generate fresh production
+     JWT_SECRET_KEY and ENCRYPTION_KEY.
+   - Vercel: import the frontend folder, set NEXT_PUBLIC_API_URL to the
+     Railway backend URL, add frontend/.env.local.example values.
+
+
+KEY TECHNICAL GOTCHAS TO CARRY FORWARD
+--------------------------------------
+
+1. bcrypt PINNED to 4.0.1 — don't upgrade, passlib 1.7.4 is incompatible with
+   bcrypt ≥4.1. Same rule as Phase 1.
+
+2. slowapi needs `request: Request` as a parameter on every decorated route.
+   Missing it = decorator silently no-ops. Only signup, login, and
+   password-reset/request have it today.
+
+3. The ENCRYPTION_KEY in the working .env (LRy0cZB1qnoi...) is a Fernet key,
+   but Fernet keys happen to decode to exactly 32 bytes, so it's accepted by
+   AES-256-GCM. Don't regenerate using `Fernet.generate_key()` next time —
+   use the AESGCM snippet in .env.example.
+
+4. Celery workers use a SYNC engine (psycopg2). The FastAPI app uses the
+   ASYNC engine (asyncpg). Both read settings.DATABASE_URL; the sync URL is
+   derived via settings.sync_database_url.
+
+5. RLS is active. Any new DB query that runs outside a request-authenticated
+   context (e.g., the seed script, Celery tasks) must either:
+     a) Run as a role with BYPASSRLS (migrations do this), OR
+     b) SET app.current_agency_id before querying (the sync task uses
+        plain agency_id filters in app-layer Python + reads across all
+        agencies in the nightly fan-out, which is fine because it runs as
+        the owner role).
+
+6. Metric upsert uses delete-then-insert on the primary key tuple
+   (client_id, platform_type, metric_name, metric_date, campaign_id). Good
+   enough at current volumes; switch to a true PG ON CONFLICT when a single
+   sync exceeds ~10k rows.
+
+7. Mock data is deterministic per (client_id, platform_type, date). If you
+   run the same sync twice on the same day you get identical numbers. That's
+   intentional so Phase 3 tests are stable.
+
+
+USER CONTEXT (carried forward, same as Phase 2)
+-----------------------------------------------
+- Non-coder; wants exact commands + complete code in each phase.
+- Windows 11 + Docker Desktop + npm all working.
+- GitHub / Railway / Vercel accounts present; deployment deferred.
+- Still blocked on Google OAuth verification for platform connections.
+- Project path:
+    C:\Users\S.PRAVEEN KUMAR\Downloads\Digital Marketing\
+    online-smart-pick-ecosystem\online-smart-pick-ecosystem-phase1\
+    online-smart-pick-ecosystem
+- Brand tokens: brand.blue #1E3A5F, brand.green #10B981 (Tailwind).
+- Handoff methodology: one phase per chat, zip + summary upload at the
+  start of each new chat.
+===============================================================================
